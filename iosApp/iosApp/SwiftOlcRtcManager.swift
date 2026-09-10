@@ -1,5 +1,6 @@
 import Darwin
 import AVFoundation
+import CFNetwork
 import Foundation
 import OlcRtcMobile
 import SharedUI
@@ -21,6 +22,7 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
     }
 
     func start(request: IosOlcRtcStartRequest) -> IosBridgeResult {
+        let dnsServer = OlcRtcDnsSelector.select(configured: request.dnsServer, log: makeLogger())
         lock.lock()
         let previous = runtime
         let next = MobileNew()!
@@ -34,7 +36,7 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
             try next.setRoom(request.roomId)
             try next.setKey(request.keyHex)
             next.setDeviceID(request.clientId)
-            try next.setDNS(request.dnsServer)
+            try next.setDNS(dnsServer)
             try next.setSocksListenHost("127.0.0.1")
             try next.setSocksPort(Int(request.socksPort))
             try next.setSocksCredentials(request.socksUser, password: request.socksPass)
@@ -111,7 +113,9 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
 
         do {
             var value: Int64 = -1
-            try MobileNew()!.ping(
+            let probe = MobileNew()!
+            try probe.setDNS(OlcRtcDnsSelector.select(configured: request.dnsServer, log: { _ in }))
+            try probe.ping(
                 request.carrierName,
                 transportName: request.transportName,
                 roomID: request.roomId,
@@ -138,7 +142,9 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
 
         do {
             var value: Int64 = -1
-            try MobileNew()!.check(
+            let probe = MobileNew()!
+            try probe.setDNS(OlcRtcDnsSelector.select(configured: request.dnsServer, log: { _ in }))
+            try probe.check(
                 request.carrierName,
                 transportName: request.transportName,
                 roomID: request.roomId,
@@ -448,5 +454,128 @@ private final class NativeLogWriter: NSObject, MobileLogWriterProtocol {
 
     func writeLog(_ message: String?) {
         if let message, !message.isEmpty { output(message) }
+    }
+}
+
+/// Picks the DNS server olcRTC uses for provider signaling.
+///
+/// olcRTC resolves provider hosts with its own UDP resolver, so it never sees the
+/// carrier DNS unless we pass it. Whitelisted mobile networks drop UDP 53 to public
+/// resolvers, which made the fixed 1.1.1.1 time out on WB guest-register.
+/// Order mirrors Android: configured value, system resolver, fallback.
+enum OlcRtcDnsSelector {
+    static let fallbackServer = "1.1.1.1:53"
+    private static let lastSystemServerKey = "ios_last_system_dns_server"
+
+    static func select(configured: String, log: (String) -> Void) -> String {
+        let trimmed = configured.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            log("Using configured DNS server \(trimmed) for olcRTC signaling")
+            return trimmed
+        }
+
+        let defaults = UserDefaults.standard
+        if isVpnActive() {
+            // A VPN such as Happ now owns the resolver list, and its DNS may be
+            // routed back through this very tunnel. Prefer the last carrier DNS.
+            if let cached = defaults.string(forKey: lastSystemServerKey), !cached.isEmpty {
+                log("VPN is active; using last system DNS server \(cached) for olcRTC signaling")
+                return cached
+            }
+            log("VPN is active and no system DNS is known; using fallback DNS server \(fallbackServer)")
+            return fallbackServer
+        }
+
+        if let system = systemServers().first {
+            defaults.set(system, forKey: lastSystemServerKey)
+            log("Using system DNS server \(system) for olcRTC signaling")
+            return system
+        }
+        log("System DNS is unavailable; using fallback DNS server \(fallbackServer)")
+        return fallbackServer
+    }
+
+    private typealias ResNinit = @convention(c) (UnsafeMutableRawPointer) -> Int32
+    private typealias ResGetServers = @convention(c) (UnsafeMutableRawPointer, UnsafeMutableRawPointer, Int32) -> Int32
+    private typealias ResNdestroy = @convention(c) (UnsafeMutableRawPointer) -> Void
+
+    // resolv.h is not visible to Swift without a bridging header, so libresolv is
+    // loaded at runtime. Buffers are oversized: __res_9_state is 552 bytes and
+    // res_9_sockaddr_union is 128 bytes on arm64.
+    private static let stateByteCount = 4096
+    private static let sockaddrUnionByteCount = 128
+    private static let maxServers = 3 // MAXNS
+
+    /// System resolver addresses as "host:port", IPv4 first.
+    static func systemServers() -> [String] {
+        guard let handle = dlopen("/usr/lib/libresolv.9.dylib", RTLD_NOW) else { return [] }
+        defer { dlclose(handle) }
+        guard let ninitSymbol = dlsym(handle, "res_9_ninit"),
+              let getServersSymbol = dlsym(handle, "res_9_getservers"),
+              let ndestroySymbol = dlsym(handle, "res_9_ndestroy") else { return [] }
+        let ninit = unsafeBitCast(ninitSymbol, to: ResNinit.self)
+        let getServers = unsafeBitCast(getServersSymbol, to: ResGetServers.self)
+        let ndestroy = unsafeBitCast(ndestroySymbol, to: ResNdestroy.self)
+
+        let state = UnsafeMutableRawPointer.allocate(byteCount: stateByteCount, alignment: 16)
+        defer { state.deallocate() }
+        state.initializeMemory(as: UInt8.self, repeating: 0, count: stateByteCount)
+        guard ninit(state) == 0 else { return [] }
+        defer { ndestroy(state) }
+
+        let listByteCount = sockaddrUnionByteCount * maxServers
+        let list = UnsafeMutableRawPointer.allocate(byteCount: listByteCount, alignment: 16)
+        defer { list.deallocate() }
+        list.initializeMemory(as: UInt8.self, repeating: 0, count: listByteCount)
+        let count = min(Int(getServers(state, list, Int32(maxServers))), maxServers)
+
+        var ipv4: [String] = []
+        var ipv6: [String] = []
+        for index in 0..<max(count, 0) {
+            let entry = list + index * sockaddrUnionByteCount
+            switch Int32(entry.load(as: sockaddr.self).sa_family) {
+            case AF_INET:
+                let address = entry.load(as: sockaddr_in.self)
+                let host = UInt32(bigEndian: address.sin_addr.s_addr)
+                // Skip loopback, unspecified and the 198.18.0.0/15 fake-IP range.
+                if host >> 24 == 127 || host == 0 || host & 0xFFFE_0000 == 0xC612_0000 { continue }
+                var raw = address.sin_addr
+                if let text = presentation(AF_INET, &raw) {
+                    ipv4.append("\(text):\(port(address.sin_port))")
+                }
+            case AF_INET6:
+                let address = entry.load(as: sockaddr_in6.self)
+                var raw = address.sin6_addr
+                let bytes = withUnsafeBytes(of: &raw) { Array($0) }
+                let isUnspecified = bytes.allSatisfy { $0 == 0 }
+                let isLoopback = bytes.dropLast().allSatisfy { $0 == 0 } && bytes.last == 1
+                let isLinkLocal = bytes[0] == 0xFE && bytes[1] & 0xC0 == 0x80
+                if isUnspecified || isLoopback || isLinkLocal { continue }
+                if let text = presentation(AF_INET6, &raw) {
+                    ipv6.append("[\(text)]:\(port(address.sin6_port))")
+                }
+            default:
+                continue
+            }
+        }
+        return ipv4 + ipv6
+    }
+
+    private static func presentation(_ family: Int32, _ address: UnsafeRawPointer) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+        guard inet_ntop(family, address, &buffer, socklen_t(buffer.count)) != nil else { return nil }
+        return buffer.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+    }
+
+    private static func port(_ networkOrder: in_port_t) -> UInt16 {
+        let value = UInt16(bigEndian: networkOrder)
+        return value == 0 ? 53 : value
+    }
+
+    private static func isVpnActive() -> Bool {
+        guard let settings = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any],
+              let scoped = settings["__SCOPED__"] as? [String: Any] else { return false }
+        let tunnelPrefixes = ["utun", "ipsec", "ppp", "tap", "tun"]
+        return scoped.keys.contains { name in tunnelPrefixes.contains { name.hasPrefix($0) } }
     }
 }
