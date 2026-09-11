@@ -12,8 +12,8 @@ jobs:
   build-ios:
     runs-on: macos-latest
     env:
-      OLCBOX_VERSION: "1.0.129"
-      OLCBOX_VERSION_CODE: "129"
+      OLCBOX_VERSION: "1.0.130"
+      OLCBOX_VERSION_CODE: "130"
 
     steps:
       - name: Checkout olcbox
@@ -32,6 +32,12 @@ jobs:
           ref: ${{ steps.core.outputs.ref }}
           path: olcrtc
           submodules: recursive
+
+      - name: "Test only: raise LiveKit connect timeout to 20s"
+        working-directory: olcrtc
+        run: |
+          perl -0pi -e 's/\Qlksdk.WithAutoSubscribe(true),\E/lksdk.WithAutoSubscribe(true),\n\t\tlksdk.WithConnectTimeout(20 * time.Second),/' internal/engine/livekit/livekit.go
+          grep -n "WithConnectTimeout" internal/engine/livekit/livekit.go
 
       - name: Setup JDK
         uses: actions/setup-java@v6
