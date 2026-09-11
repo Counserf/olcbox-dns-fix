@@ -1,0 +1,127 @@
+name: Build unsigned iOS IPA
+
+# Manual iOS-only build for forks: no signing secrets, no release publishing.
+on:
+  push:
+    branches: [ci/ios-build-check]
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    env:
+      OLCBOX_VERSION: "1.0.128"
+      OLCBOX_VERSION_CODE: "128"
+
+    steps:
+      - name: Checkout olcbox
+        uses: actions/checkout@v7
+        with:
+          path: olcbox
+
+      - name: Resolve pinned olcrtc revision
+        id: core
+        run: echo "ref=$(cat olcbox/.github/olcrtc-revision)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout olcrtc
+        uses: actions/checkout@v7
+        with:
+          repository: alananisimov/olcrtc
+          ref: ${{ steps.core.outputs.ref }}
+          path: olcrtc
+          submodules: recursive
+
+      - name: Setup JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Select Xcode 26
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '^26.0'
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.3'
+          cache-dependency-path: olcrtc/go.sum
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Install Go mobile tooling
+        run: |
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          go install golang.org/x/mobile/cmd/gomobile@latest
+
+      - name: Initialize gomobile
+        working-directory: olcrtc
+        run: gomobile init
+
+      - name: Build unsigned iOS app
+        working-directory: olcbox
+        run: |
+          export OLCRTC_REPO="${{ github.workspace }}/olcrtc"
+          xcodebuild \
+            -project iosApp/iosApp.xcodeproj \
+            -scheme iosApp \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build/ios-ipa/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned IPA
+        working-directory: olcbox
+        run: |
+          app_path="build/ios-ipa/DerivedData/Build/Products/Release-iphoneos/iosApp.app"
+          if [ ! -d "$app_path" ]; then
+            echo "iOS app product was not found at $app_path" >&2
+            exit 1
+          fi
+
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${OLCBOX_VERSION}" "$app_path/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${OLCBOX_VERSION_CODE}" "$app_path/Info.plist"
+
+          ipa="Olcbox-${OLCBOX_VERSION}-ios-unsigned-system-dns.ipa"
+          rm -rf build/ios-ipa/package dist
+          mkdir -p build/ios-ipa/package/Payload dist
+          cp -R "$app_path" build/ios-ipa/package/Payload/
+          (cd build/ios-ipa/package && /usr/bin/zip -qry "${GITHUB_WORKSPACE}/olcbox/dist/${ipa}" Payload)
+          unzip -t "dist/${ipa}"
+          (cd dist && shasum -a 256 "${ipa}" | tee SHA256SUMS.txt)
+
+      - name: Check SDK symbols
+        run: |
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          grep -l "dns_configuration_copy" "$sdk"/usr/lib/system/*.tbd || echo "dns_configuration_copy not listed in SDK stubs"
+
+      - name: Build test variant without dnsinfo
+        working-directory: olcbox
+        run: |
+          export OLCRTC_REPO="${{ github.workspace }}/olcrtc"
+          sed -i "" "s/\"dns_configuration_copy\"/\"dns_configuration_copy_disabled_for_test\"/" iosApp/iosApp/SwiftOlcRtcManager.swift
+          grep -c dns_configuration_copy_disabled_for_test iosApp/iosApp/SwiftOlcRtcManager.swift
+          xcodebuild -project iosApp/iosApp.xcodeproj -scheme iosApp -sdk iphoneos -configuration Release             -derivedDataPath build/ios-ipa/DerivedData CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+          app_path="build/ios-ipa/DerivedData/Build/Products/Release-iphoneos/iosApp.app"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${OLCBOX_VERSION}" "$app_path/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${OLCBOX_VERSION_CODE}" "$app_path/Info.plist"
+          ipa="Olcbox-${OLCBOX_VERSION}-ios-unsigned-test-no-dnsinfo.ipa"
+          rm -rf build/ios-ipa/package2 && mkdir -p build/ios-ipa/package2/Payload
+          cp -R "$app_path" build/ios-ipa/package2/Payload/
+          (cd build/ios-ipa/package2 && /usr/bin/zip -qry "${GITHUB_WORKSPACE}/olcbox/dist/${ipa}" Payload)
+          (cd dist && shasum -a 256 *.ipa | tee SHA256SUMS.txt)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Olcbox-ios-unsigned-system-dns
+          path: |
+            olcbox/dist/*.ipa
+            olcbox/dist/SHA256SUMS.txt
