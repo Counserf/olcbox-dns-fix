@@ -12,11 +12,16 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
     private var logWriter: IosLogWriter?
     private var runtime = MobileNew()!
     private let logLock = NSLock()
-    private lazy var nativeLogWriter = NativeLogWriter { [weak self] in self?.log($0) }
+    private lazy var nativeLogWriter = NativeLogWriter { [weak self] in
+        self?.trackSession($0)
+        self?.log($0)
+    }
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private let lock = NSLock()
     private let keepAlive = SilentAudioKeepAlive()
     private var startedNetwork: String?
+    private var sessionLostAt: TimeInterval?   // guarded by logLock
+    private static let sessionRestoreTimeout: TimeInterval = 30
 
     func deviceLog(message: String) {
         OlcboxDiag.emit("[olcbox] " + message)
@@ -40,6 +45,7 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
         let next = MobileNew()!
         runtime = next
         startedNetwork = interface?.network
+        setSessionLost(false)
         try? previous.stop(1)
         DispatchQueue.global(qos: .utility).async { try? previous.stop(5_000) }
         do {
@@ -108,6 +114,7 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
         let previous = runtime
         runtime = MobileNew()!
         startedNetwork = nil
+        setSessionLost(false)
         try? previous.stop(1)
         DispatchQueue.global(qos: .utility).async { try? previous.stop(5_000) }
         endBackgroundTaskIfNeeded()
@@ -119,12 +126,39 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
         let running = runtime.state() == "running"
         let started = startedNetwork
         lock.unlock()
+        guard running else { return false }
         // olcRTC reconnects inside a running session but keeps the DNS server it
         // was started with. After a network change report "not running", so the
         // watchdog rebuilds the session with the new network's DNS.
-        guard running, let started, let now = PhysicalInterface.current()?.network, now != started else { return running }
-        log("Physical network changed (\(started) -> \(now)); rebuilding olcRTC")
-        return false
+        if let started, let now = PhysicalInterface.current()?.network, now != started {
+            log("Physical network changed (\(started) -> \(now)); rebuilding olcRTC")
+            return false
+        }
+        // Its own reconnect can also keep failing the handshake for minutes after
+        // a provider drop, while a clean restart takes seconds.
+        logLock.lock()
+        let lostFor = sessionLostAt.map { ProcessInfo.processInfo.systemUptime - $0 }
+        logLock.unlock()
+        if let lostFor, lostFor >= Self.sessionRestoreTimeout {
+            log("olcRTC has not restored its session for \(Int(lostFor))s; rebuilding olcRTC")
+            return false
+        }
+        return true
+    }
+
+    /// olcRTC exposes no session state, so follow it from its log.
+    private func trackSession(_ line: String) {
+        if line.contains("client reconnect reason=") {
+            setSessionLost(true)
+        } else if line.contains("opened (device=") {
+            setSessionLost(false)
+        }
+    }
+
+    private func setSessionLost(_ lost: Bool) {
+        logLock.lock()
+        sessionLostAt = lost ? (sessionLostAt ?? ProcessInfo.processInfo.systemUptime) : nil
+        logLock.unlock()
     }
 
     func ping(request: IosOlcRtcCheckRequest) -> IosLongResult {
