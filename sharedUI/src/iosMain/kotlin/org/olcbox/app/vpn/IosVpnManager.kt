@@ -340,6 +340,8 @@ class IosVpnManager(
     }
 
     private fun addLog(message: String) {
+        // Test builds: mirror to the device log so it can be recorded over USB.
+        olcRtcBridge.deviceLog(message)
         _logs.value = (_logs.value + message).takeLast(MAX_LOG_LINES)
     }
 

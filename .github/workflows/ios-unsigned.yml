@@ -12,8 +12,8 @@ jobs:
   build-ios:
     runs-on: macos-latest
     env:
-      OLCBOX_VERSION: "1.0.128"
-      OLCBOX_VERSION_CODE: "128"
+      OLCBOX_VERSION: "1.0.129"
+      OLCBOX_VERSION_CODE: "129"
 
     steps:
       - name: Checkout olcbox
@@ -89,7 +89,7 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${OLCBOX_VERSION}" "$app_path/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${OLCBOX_VERSION_CODE}" "$app_path/Info.plist"
 
-          ipa="Olcbox-${OLCBOX_VERSION}-ios-unsigned-system-dns.ipa"
+          ipa="Olcbox-${OLCBOX_VERSION}-ios-test-diag.ipa"
           rm -rf build/ios-ipa/package dist
           mkdir -p build/ios-ipa/package/Payload dist
           cp -R "$app_path" build/ios-ipa/package/Payload/
@@ -112,7 +112,7 @@ jobs:
           app_path="build/ios-ipa/DerivedData/Build/Products/Release-iphoneos/iosApp.app"
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${OLCBOX_VERSION}" "$app_path/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${OLCBOX_VERSION_CODE}" "$app_path/Info.plist"
-          ipa="Olcbox-${OLCBOX_VERSION}-ios-unsigned-test-no-dnsinfo.ipa"
+          ipa="Olcbox-${OLCBOX_VERSION}-ios-test-diag-no-dnsinfo.ipa"
           rm -rf build/ios-ipa/package2 && mkdir -p build/ios-ipa/package2/Payload
           cp -R "$app_path" build/ios-ipa/package2/Payload/
           (cd build/ios-ipa/package2 && /usr/bin/zip -qry "${GITHUB_WORKSPACE}/olcbox/dist/${ipa}" Payload)
@@ -121,7 +121,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: Olcbox-ios-unsigned-system-dns
+          name: Olcbox-ios-test-diag
           path: |
             olcbox/dist/*.ipa
             olcbox/dist/SHA256SUMS.txt

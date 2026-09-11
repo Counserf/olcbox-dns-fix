@@ -3,6 +3,7 @@ import AVFoundation
 import CFNetwork
 import Foundation
 import Network
+import os
 import OlcRtcMobile
 import SharedUI
 import UIKit
@@ -17,6 +18,10 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
     private let keepAlive = SilentAudioKeepAlive()
     private var startedNetwork: String?
 
+    func deviceLog(message: String) {
+        OlcboxDiag.emit("[olcbox] " + message)
+    }
+
     func setLogWriter(writer: IosLogWriter?) {
         logLock.lock()
         defer { logLock.unlock() }
@@ -24,6 +29,7 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
     }
 
     func start(request: IosOlcRtcStartRequest) -> IosBridgeResult {
+        OlcboxDiag.startPathMonitor()
         let interface = PhysicalInterface.current()
         guard let dnsServer = OlcRtcDnsSelector.select(configured: request.dnsServer, interface: interface, log: makeLogger()) else {
             // Usually the network is still coming up; the reconnect loop retries soon.
@@ -505,6 +511,7 @@ enum OlcRtcDnsSelector {
             log("No Wi-Fi or cellular interface is up; no DNS server for olcRTC")
             return nil
         }
+        dumpDiagnostics(log: log)
 
         let scoped = interfaceServers(index: interface.index, log: log)
         if !scoped.isEmpty { log("System DNS servers of \(interface.name): \(scoped.joined(separator: ", "))") }
@@ -794,8 +801,9 @@ struct PhysicalInterface {
     func bind(_ fd: Int32) {
         var value = index
         let size = socklen_t(MemoryLayout<UInt32>.size)
-        _ = setsockopt(fd, IPPROTO_IP, Self.ipBoundIf, &value, size)
-        _ = setsockopt(fd, IPPROTO_IPV6, Self.ipv6BoundIf, &value, size)
+        let ipv4 = setsockopt(fd, IPPROTO_IP, Self.ipBoundIf, &value, size)
+        let ipv6 = setsockopt(fd, IPPROTO_IPV6, Self.ipv6BoundIf, &value, size)
+        OlcboxDiag.noteBind(fd: fd, interface: name, ipv4: ipv4, ipv6: ipv6)
     }
 }
 
@@ -847,5 +855,112 @@ private final class InterfaceSocketProtector: NSObject, MobileSocketProtectorPro
         // after a network change its new sockets must follow the new interface.
         PhysicalInterface.current()?.bind(Int32(truncatingIfNeeded: fd))
         return true
+    }
+}
+
+// MARK: - Test diagnostics (test builds only, not for upstream)
+
+/// Writes to the device log so a computer can record it over USB.
+enum OlcboxDiag {
+    private static let lock = NSLock()
+    private static let osLog = OSLog(subsystem: "org.olcbox.app.ios", category: "olcbox")
+    nonisolated(unsafe) private static var monitor: NWPathMonitor?
+
+    /// Public text, so a computer recording the device log can read it
+    /// (NSLog arguments show up as <private>).
+    static func emit(_ message: String) {
+        os_log("%{public}@", log: osLog, type: .default, message)
+    }
+    nonisolated(unsafe) private static var binds = 0
+
+    static func startPathMonitor() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard monitor == nil else { return }
+        let pathMonitor = NWPathMonitor()
+        pathMonitor.pathUpdateHandler = { path in
+            let interfaces = path.availableInterfaces.map { "\($0.name)/\(kind($0.type))" }.joined(separator: " ")
+            emit("[olcbox-diag] path status=\(path.status) interfaces=[\(interfaces)] expensive=\(path.isExpensive) constrained=\(path.isConstrained)")
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "olcbox.diag.path"))
+        monitor = pathMonitor
+    }
+
+    static func noteBind(fd: Int32, interface: String, ipv4: Int32, ipv6: Int32) {
+        lock.lock()
+        binds += 1
+        let count = binds
+        lock.unlock()
+        if count <= 40 || count % 100 == 0 {
+            emit("[olcbox-diag] bind #\(count) fd=\(fd) \(interface) IP_BOUND_IF=\(ipv4) IPV6_BOUND_IF=\(ipv6) errno=\(errno)")
+        }
+    }
+
+    private static func kind(_ type: NWInterface.InterfaceType) -> String {
+        switch type {
+        case .wifi: return "wifi"
+        case .cellular: return "cellular"
+        case .wiredEthernet: return "wired"
+        case .loopback: return "loopback"
+        case .other: return "other"
+        @unknown default: return "unknown"
+        }
+    }
+}
+
+extension OlcRtcDnsSelector {
+    /// Everything the DNS choice depends on, logged before each selection.
+    static func dumpDiagnostics(log: (String) -> Void) {
+        log("diag: physical="+(PhysicalInterface.current()?.network ?? "none"))
+        log("diag: vpnActive=\(isVpnActive()) systemServers=\(systemServers())")
+
+        var head: UnsafeMutablePointer<ifaddrs>?
+        if getifaddrs(&head) == 0 {
+            var lines: [String] = []
+            var cursor = head
+            while let entry = cursor {
+                cursor = entry.pointee.ifa_next
+                guard let address = entry.pointee.ifa_addr, entry.pointee.ifa_flags & UInt32(IFF_UP) != 0 else { continue }
+                let name = String(cString: entry.pointee.ifa_name)
+                if let text = server(UnsafeRawPointer(address)) {
+                    lines.append("\(name)=\(text.hasSuffix(":53") ? String(text.dropLast(3)) : text)")
+                }
+            }
+            freeifaddrs(head)
+            log("diag: interfaces \(lines.joined(separator: " "))")
+        }
+
+        let defaultHandle = UnsafeMutableRawPointer(bitPattern: -2)
+        guard let copySymbol = dlsym(defaultHandle, "dns_configuration_copy"),
+              let freeSymbol = dlsym(defaultHandle, "dns_configuration_free"),
+              let config = unsafeBitCast(copySymbol, to: DnsConfigurationCopy.self)() else {
+            log("diag: dnsinfo unavailable")
+            return
+        }
+        defer { unsafeBitCast(freeSymbol, to: DnsConfigurationFree.self)(config) }
+        log("diag: dnsinfo n_resolver=\(config.loadUnaligned(fromByteOffset: 0, as: Int32.self))"
+            + " n_scoped=\(config.loadUnaligned(fromByteOffset: 12, as: Int32.self))"
+            + " version=\(config.loadUnaligned(fromByteOffset: 44, as: UInt32.self))")
+        for (label, countOffset, listOffset) in [("default", 0, 4), ("scoped", 12, 16)] {
+            guard let total = readCount(config, countOffset), let list = pointer(config, listOffset, near: config) else { continue }
+            for slot in 0..<total {
+                guard let resolver = pointer(list, slot * 8, near: config) else {
+                    log("diag: \(label)[\(slot)] pointer outside buffer")
+                    continue
+                }
+                var servers: [String] = []
+                if let count = readCount(resolver, 8), let nameservers = pointer(resolver, 12, near: config) {
+                    servers = (0..<count).compactMap { pointer(nameservers, $0 * 8, near: config).flatMap(server) }
+                }
+                let ifIndex = resolver.loadUnaligned(fromByteOffset: 64, as: UInt32.self)
+                let flags = resolver.loadUnaligned(fromByteOffset: 68, as: UInt32.self)
+                log("diag: \(label)[\(slot)] if_index=\(ifIndex) if_name=\(cString(resolver, 88, near: config))"
+                    + " flags=0x\(String(flags, radix: 16)) domain=\(cString(resolver, 0, near: config)) servers=\(servers)")
+            }
+        }
+    }
+
+    private static func cString(_ base: UnsafeRawPointer, _ offset: Int, near buffer: UnsafeRawPointer) -> String {
+        pointer(base, offset, near: buffer).map { String(cString: $0.assumingMemoryBound(to: CChar.self)) } ?? "-"
     }
 }

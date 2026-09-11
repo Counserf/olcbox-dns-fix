@@ -59,6 +59,8 @@ interface IosOlcRtcBridge {
     fun isRunning(): Boolean
     fun ping(request: IosOlcRtcCheckRequest): IosLongResult
     fun check(request: IosOlcRtcCheckRequest): IosLongResult
+    // Test builds: write a line to the device log as public text.
+    fun deviceLog(message: String)
 }
 
 interface IosPlatformBridge {
