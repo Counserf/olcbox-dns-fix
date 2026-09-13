@@ -12,8 +12,8 @@ jobs:
   build-ios:
     runs-on: macos-latest
     env:
-      OLCBOX_VERSION: "1.0.133"
-      OLCBOX_VERSION_CODE: "133"
+      OLCBOX_VERSION: "1.0.134"
+      OLCBOX_VERSION_CODE: "134"
 
     steps:
       - name: Checkout olcbox
@@ -39,23 +39,6 @@ jobs:
           perl -0pi -e 's/\Qlksdk.WithAutoSubscribe(true),\E/lksdk.WithAutoSubscribe(true),\n\t\tlksdk.WithConnectTimeout(20 * time.Second),/' internal/engine/livekit/livekit.go
           grep -n "WithConnectTimeout" internal/engine/livekit/livekit.go
 
-      - name: Check the constants this code assumes
-        run: |
-          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
-          echo "--- IP_BOUND_IF / IPV6_BOUND_IF as the SDK defines them"
-          grep -rhn "define.*IP_BOUND_IF\|define.*IPV6_BOUND_IF" "$sdk/usr/include/netinet/in.h" "$sdk/usr/include/netinet6/in6.h" || echo "not found in headers"
-          echo "--- sizes the libresolv buffers must cover (host SDK, same libinfo headers)"
-          {
-            echo '#include <stdio.h>'
-            echo '#include <resolv.h>'
-            echo 'int main(void){'
-            echo '  printf("__res_state=%zu union=%zu MAXNS=%d\n", sizeof(struct __res_state), sizeof(union res_sockaddr_union), MAXNS);'
-            echo '  return 0;'
-            echo '}'
-          } > /tmp/sizes.c
-          cc -o /tmp/sizes /tmp/sizes.c && /tmp/sizes
-          echo "--- does the SDK ship dnsinfo.h at all"
-          find "$sdk" -name 'dnsinfo*.h' 2>/dev/null | head -3 || true
       - name: Setup JDK
         uses: actions/setup-java@v6
         with:
