@@ -536,8 +536,9 @@ enum OlcRtcDnsSelector {
     private typealias ResNdestroy = @convention(c) (UnsafeMutableRawPointer) -> Void
 
     // resolv.h is not visible to Swift without a bridging header, so libresolv is
-    // loaded at runtime. Buffers are oversized: __res_9_state is 552 bytes and
-    // res_9_sockaddr_union is 128 bytes on arm64.
+    // loaded at runtime. Sizes checked against the SDK headers: __res_state is
+    // 552 bytes (the buffer below is deliberately larger), res_sockaddr_union is
+    // 128, MAXNS is 3.
     private static let stateByteCount = 4096
     private static let sockaddrUnionByteCount = 128
     private static let maxServers = 3 // MAXNS
@@ -734,6 +735,14 @@ enum OlcRtcDnsSelector {
         // Probing through another interface would measure the wrong path.
         guard interface.bind(fd) else { return false }
 
+        // Connected, so the kernel drops datagrams from anyone but this server:
+        // on an unconnected socket a host on the same network could answer first
+        // and have its resolver picked as the main one.
+        let connected = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, target.length) }
+        }
+        guard connected == 0 else { return false }
+
         let id = UInt16.random(in: .min ... .max)
         var query: [UInt8] = [UInt8(id >> 8), UInt8(id & 0xFF), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]
         for label in ["stream", "wb", "ru"] {
@@ -741,18 +750,19 @@ enum OlcRtcDnsSelector {
             query.append(contentsOf: label.utf8)
         }
         query.append(contentsOf: [0, 0, 1, 0, 1]) // root, type A, class IN
-        let sent = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sendto(fd, query, query.count, 0, $0, target.length) }
-        }
+        let sent = send(fd, query, query.count, 0)
         var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
         guard sent == query.count, poll(&poller, 1, 1_000) == 1 else { return false }
         var reply = [UInt8](repeating: 0, count: 512)
-        let received = recv(fd, &reply, 512, 0)
-        // Header: id, QR (is a reply), RCODE (0 = NOERROR), ANCOUNT (records).
+        let received = recv(fd, &reply, reply.count, 0)
+        // Header: id, QR (is a reply), TC (truncated), RCODE, ANCOUNT.
         guard received >= 12, reply[0] == query[0], reply[1] == query[1], reply[2] & 0x80 != 0 else { return false }
-        let rcode = reply[3] & 0x0F
+        guard reply[3] & 0x0F == 0 else { return false } // anything but NOERROR
+        // A truncated reply proves the resolver answered even with no records in
+        // this datagram; otherwise an actual record has to be there.
+        let truncated = reply[2] & 0x02 != 0
         let answerCount = Int(reply[6]) << 8 | Int(reply[7])
-        return rcode == 0 && answerCount > 0
+        return truncated || answerCount > 0
     }
 
     /// Parses "host:port" or "[v6]:port" with a numeric host.
@@ -801,7 +811,7 @@ struct PhysicalInterface {
     /// Changes with the interface or its address, i.e. on any network switch.
     var network: String { "\(name) \(address)" }
 
-    // netinet/in.h and netinet6/in6.h
+    // Values read out of the iOS SDK headers (netinet/in.h, netinet6/in6.h).
     private static let ipBoundIf: Int32 = 25
     private static let ipv6BoundIf: Int32 = 125
 
