@@ -39,6 +39,29 @@ jobs:
           perl -0pi -e 's/\Qlksdk.WithAutoSubscribe(true),\E/lksdk.WithAutoSubscribe(true),\n\t\tlksdk.WithConnectTimeout(20 * time.Second),/' internal/engine/livekit/livekit.go
           grep -n "WithConnectTimeout" internal/engine/livekit/livekit.go
 
+      - name: Check the constants this code assumes
+        run: |
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "--- IP_BOUND_IF / IPV6_BOUND_IF in the iOS SDK headers"
+          grep -rn "define[[:space:]]*IP_BOUND_IF\|define[[:space:]]*IPV6_BOUND_IF" "$sdk/usr/include/netinet/in.h" "$sdk/usr/include/netinet6/in6.h" || true
+          echo "--- sizes the libresolv buffers must cover"
+          cat > /tmp/sizes.c <<'EOF'
+          #include <stdio.h>
+          #include <resolv.h>
+          int main(void) {
+              printf("sizeof(struct __res_state) = %zu
+", sizeof(struct __res_state));
+              printf("sizeof(res_9_sockaddr_union) = %zu
+", sizeof(union res_sockaddr_union));
+              printf("MAXNS = %d
+", MAXNS);
+              return 0;
+          }
+EOF
+          sed -i "" 's/^          //' /tmp/sizes.c
+          cc -o /tmp/sizes /tmp/sizes.c && /tmp/sizes
+          echo "--- dnsinfo layout, from the SDK header if it ships one"
+          find "$sdk" -name "dnsinfo.h" 2>/dev/null | head -3
       - name: Setup JDK
         uses: actions/setup-java@v6
         with:
