@@ -25,7 +25,8 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
 
     func start(request: IosOlcRtcStartRequest) -> IosBridgeResult {
         let interface = PhysicalInterface.current()
-        guard let dnsServer = OlcRtcDnsSelector.select(configured: request.dnsServer, interface: interface, log: makeLogger()) else {
+        let probeHost = OlcRtcDnsSelector.probeHost(provider: request.carrierName, room: request.roomId)
+        guard let dnsServer = OlcRtcDnsSelector.select(configured: request.dnsServer, interface: interface, host: probeHost, log: makeLogger()) else {
             // Usually the network is still coming up; the reconnect loop retries soon.
             return IosBridgeResult(success: false, message: "No DNS server is reachable")
         }
@@ -129,7 +130,7 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
 
         do {
             var value: Int64 = -1
-            try makeProbe(dnsServer: request.dnsServer).ping(
+            try makeProbe(request).ping(
                 request.carrierName,
                 transportName: request.transportName,
                 roomID: request.roomId,
@@ -156,7 +157,7 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
 
         do {
             var value: Int64 = -1
-            try makeProbe(dnsServer: request.dnsServer).check(
+            try makeProbe(request).check(
                 request.carrierName,
                 transportName: request.transportName,
                 roomID: request.roomId,
@@ -174,11 +175,12 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
         }
     }
 
-    private func makeProbe(dnsServer configured: String) throws -> MobileRuntime {
+    private func makeProbe(_ request: IosOlcRtcCheckRequest) throws -> MobileRuntime {
         let probe = MobileNew()!
         let interface = PhysicalInterface.current()
         probe.setProtector(InterfaceSocketProtector())
-        let dnsServer = OlcRtcDnsSelector.select(configured: configured, interface: interface, log: { _ in })
+        let host = OlcRtcDnsSelector.probeHost(provider: request.carrierName, room: request.roomId)
+        let dnsServer = OlcRtcDnsSelector.select(configured: request.dnsServer, interface: interface, host: host, log: { _ in })
         try probe.setDNS(dnsServer ?? OlcRtcDnsSelector.fallbackServers[1])
         return probe
     }
@@ -494,8 +496,39 @@ enum OlcRtcDnsSelector {
     private static let recentKey = "ios_recent_dns_servers"
     private static let maxRecent = 5
 
+    /// The name a resolver has to be able to look up to be of any use here: the
+    /// host olcRTC itself will resolve for this provider. A Jitsi room is the
+    /// instance URL, and a self-hosted instance may be known to some resolvers
+    /// only, so guessing one fixed name would pick a resolver that then fails.
+    static func probeHost(provider: String, room: String) -> String {
+        switch provider.lowercased() {
+        case "telemost":
+            return "telemost.yandex.ru"
+        case "jitsi":
+            let host = URL(string: room.trimmingCharacters(in: .whitespacesAndNewlines))?.host
+            return host.flatMap(validHost) ?? "meet.jit.si"
+        default:
+            return "stream.wb.ru"
+        }
+    }
+
+    /// A host that fits in a DNS question: labels of 1...63 bytes, 253 overall.
+    private static func validHost(_ host: String) -> String? {
+        let labels = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard host.utf8.count <= 253, labels.count > 1 else { return nil }
+        for label in labels {
+            guard (1...63).contains(label.utf8.count) else { return nil }
+            let allowed = label.utf8.allSatisfy {
+                $0 >= 0x61 && $0 <= 0x7A || $0 >= 0x41 && $0 <= 0x5A ||
+                    $0 >= 0x30 && $0 <= 0x39 || $0 == 0x2D || $0 == 0x5F
+            }
+            guard allowed else { return nil }
+        }
+        return host
+    }
+
     /// nil when no candidate answered; the caller fails fast and retries later.
-    static func select(configured: String, interface: PhysicalInterface?, log: (String) -> Void) -> String? {
+    static func select(configured: String, interface: PhysicalInterface?, host: String, log: (String) -> Void) -> String? {
         let trimmed = configured.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
             log("Using configured DNS server \(trimmed) for olcRTC signaling")
@@ -515,8 +548,8 @@ enum OlcRtcDnsSelector {
             .filter { seen.insert($0).inserted }
 
         for server in candidates {
-            guard answers(server, via: interface) else {
-                log("DNS server \(server) did not answer via \(interface.name)")
+            guard answers(server, via: interface, host: host) else {
+                log("DNS server \(server) did not resolve \(host) via \(interface.name)")
                 continue
             }
             if !fallbackServers.contains(server) {
@@ -525,7 +558,7 @@ enum OlcRtcDnsSelector {
             log("Using DNS server \(server) via \(interface.name) for olcRTC signaling")
             return server
         }
-        log("No DNS server answered via \(interface.name)")
+        log("No DNS server resolved \(host) via \(interface.name)")
         return nil
     }
 
@@ -726,7 +759,7 @@ enum OlcRtcDnsSelector {
     /// within a second. The point is not that something replies: a resolver that
     /// answers REFUSED or an empty NOERROR would be picked as the main one and
     /// then fail every lookup olcRTC makes, so only a real answer counts.
-    private static func answers(_ server: String, via interface: PhysicalInterface) -> Bool {
+    private static func answers(_ server: String, via interface: PhysicalInterface, host: String) -> Bool {
         guard let target = socketAddress(server) else { return false }
         var address = target.address
         let fd = socket(Int32(address.ss_family), SOCK_DGRAM, IPPROTO_UDP)
@@ -745,7 +778,7 @@ enum OlcRtcDnsSelector {
 
         let id = UInt16.random(in: .min ... .max)
         var query: [UInt8] = [UInt8(id >> 8), UInt8(id & 0xFF), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]
-        for label in ["stream", "wb", "ru"] {
+        for label in host.split(separator: ".") {
             query.append(UInt8(label.utf8.count))
             query.append(contentsOf: label.utf8)
         }
