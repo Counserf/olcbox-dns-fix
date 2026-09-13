@@ -589,62 +589,119 @@ enum OlcRtcDnsSelector {
         }
         defer { unsafeBitCast(freeSymbol, to: DnsConfigurationFree.self)(config) }
 
+        guard let blob = DnsBlob(config) else {
+            log("System DNS configuration is smaller than its own header")
+            return []
+        }
         // dns_config_t: n_scoped_resolver at 12, scoped_resolver at 16.
-        guard let scopedCount = readCount(config, 12), let resolvers = pointer(config, 16, near: config) else {
+        guard let scopedCount = blob.count(blob.base, 12),
+              let resolvers = blob.pointer(blob.base, 16, needs: scopedCount * 8) else {
             log("System DNS configuration has no per-interface resolvers")
             return []
         }
         for slot in 0..<scopedCount {
-            // dns_resolver_t: n_nameserver at 8, nameserver at 12, if_index at 64.
-            guard let resolver = pointer(resolvers, slot * 8, near: config),
-                  resolver.loadUnaligned(fromByteOffset: 64, as: UInt32.self) == index,
-                  let total = readCount(resolver, 8),
-                  let nameservers = pointer(resolver, 12, near: config) else { continue }
-            let found = (0..<total).compactMap { pointer(nameservers, $0 * 8, near: config).flatMap(server) }
+            // dns_resolver_t: n_nameserver at 8, nameserver at 12, if_index at 64,
+            // if_name at 88, so a resolver entry reaches at least that far.
+            guard let resolver = blob.pointer(resolvers, slot * 8, needs: 96),
+                  blob.read(resolver, 64, as: UInt32.self) == index,
+                  let total = blob.count(resolver, 8),
+                  let nameservers = blob.pointer(resolver, 12, needs: total * 8) else { continue }
+            let found = (0..<total).compactMap { slot -> String? in
+                blob.pointer(nameservers, slot * 8, needs: 2).flatMap { server(blob, $0) }
+            }
             if !found.isEmpty { return ordered(found) }
         }
         log("System DNS configuration has \(scopedCount) per-interface resolvers, none for interface \(index)")
         return []
     }
 
-    /// A pointer stored at base+offset, accepted only inside the configuration
-    /// buffer (dnsinfo keeps every entry in one allocation).
-    private static func pointer(_ base: UnsafeRawPointer, _ offset: Int, near buffer: UnsafeRawPointer) -> UnsafeRawPointer? {
-        let value = UInt(base.loadUnaligned(fromByteOffset: offset, as: UInt64.self))
-        let start = UInt(bitPattern: buffer)
-        guard value > start, value - start < 1 << 20 else { return nil }
-        return UnsafeRawPointer(bitPattern: value)
-    }
+    /// The dnsinfo reply together with the size of its allocation. dnsinfo hands
+    /// back one block with every entry inside it, so that size is what bounds a
+    /// read: a fixed window would accept a pointer past the end of a smaller
+    /// block and read memory that is not ours.
+    private struct DnsBlob {
+        let base: UnsafeRawPointer
+        let size: Int
 
-    private static func readCount(_ base: UnsafeRawPointer, _ offset: Int) -> Int? {
-        let value = Int(base.loadUnaligned(fromByteOffset: offset, as: Int32.self))
-        return (1...32).contains(value) ? value : nil
+        init?(_ allocation: UnsafeMutableRawPointer) {
+            let size = malloc_size(allocation)
+            // dns_config_t alone reaches past this; anything shorter is not the
+            // layout this code knows how to read.
+            guard size >= 48 else { return nil }
+            base = UnsafeRawPointer(allocation)
+            self.size = size
+        }
+
+        private func fits(_ address: UnsafeRawPointer, _ bytes: Int) -> Bool {
+            let start = UInt(bitPattern: base)
+            let value = UInt(bitPattern: address)
+            guard bytes >= 0, value >= start else { return false }
+            let offset = Int(value - start)
+            return offset <= size && size - offset >= bytes
+        }
+
+        func read<T>(_ from: UnsafeRawPointer, _ offset: Int, as type: T.Type) -> T? {
+            guard offset >= 0, fits(from + offset, MemoryLayout<T>.size) else { return nil }
+            return (from + offset).loadUnaligned(as: type)
+        }
+
+        /// A pointer stored at from+offset, accepted only when `bytes` of it lie
+        /// inside this block.
+        func pointer(_ from: UnsafeRawPointer, _ offset: Int, needs bytes: Int) -> UnsafeRawPointer? {
+            guard let raw = read(from, offset, as: UInt64.self),
+                  let target = UnsafeRawPointer(bitPattern: UInt(raw)),
+                  fits(target, bytes) else { return nil }
+            return target
+        }
+
+        func count(_ from: UnsafeRawPointer, _ offset: Int) -> Int? {
+            guard let value = read(from, offset, as: Int32.self), (1...32).contains(Int(value)) else { return nil }
+            return Int(value)
+        }
     }
 
     // MARK: Addresses
 
-    /// "host:port" for a resolver sockaddr; nil for loopback, unspecified,
-    /// link-local and the 198.18.0.0/15 fake-IP range.
+    /// "host:port" for a resolver sockaddr in a buffer this code owns (the
+    /// libresolv list), which is allocated with room for the largest family.
     private static func server(_ entry: UnsafeRawPointer) -> String? {
         switch Int32(entry.loadUnaligned(as: sockaddr.self).sa_family) {
-        case AF_INET:
-            let address = entry.loadUnaligned(as: sockaddr_in.self)
-            let host = UInt32(bigEndian: address.sin_addr.s_addr)
-            if host >> 24 == 127 || host == 0 || host & 0xFFFE_0000 == 0xC612_0000 { return nil }
-            var raw = address.sin_addr
-            return presentation(AF_INET, &raw).map { "\($0):\(port(address.sin_port))" }
-        case AF_INET6:
-            let address = entry.loadUnaligned(as: sockaddr_in6.self)
-            var raw = address.sin6_addr
-            let bytes = withUnsafeBytes(of: &raw) { Array($0) }
-            let isUnspecified = bytes.allSatisfy { $0 == 0 }
-            let isLoopback = bytes.dropLast().allSatisfy { $0 == 0 } && bytes.last == 1
-            let isLinkLocal = bytes[0] == 0xFE && bytes[1] & 0xC0 == 0x80
-            if isUnspecified || isLoopback || isLinkLocal { return nil }
-            return presentation(AF_INET6, &raw).map { "[\($0)]:\(port(address.sin6_port))" }
-        default:
-            return nil
+        case AF_INET: return server(entry.loadUnaligned(as: sockaddr_in.self))
+        case AF_INET6: return server(entry.loadUnaligned(as: sockaddr_in6.self))
+        default: return nil
         }
+    }
+
+    /// The same for an address inside the dnsinfo block: the family is read
+    /// first, and then only as many bytes as that family needs, so a sockaddr
+    /// sitting at the very end of the block is neither over-read nor rejected.
+    private static func server(_ blob: DnsBlob, _ entry: UnsafeRawPointer) -> String? {
+        // Darwin's sockaddr starts with sa_len, then sa_family.
+        guard let family = blob.read(entry, 1, as: UInt8.self) else { return nil }
+        switch Int32(family) {
+        case AF_INET: return blob.read(entry, 0, as: sockaddr_in.self).flatMap(server)
+        case AF_INET6: return blob.read(entry, 0, as: sockaddr_in6.self).flatMap(server)
+        default: return nil
+        }
+    }
+
+    /// nil for loopback, unspecified and the 198.18.0.0/15 fake-IP range.
+    private static func server(_ address: sockaddr_in) -> String? {
+        let host = UInt32(bigEndian: address.sin_addr.s_addr)
+        if host >> 24 == 127 || host == 0 || host & 0xFFFE_0000 == 0xC612_0000 { return nil }
+        var raw = address.sin_addr
+        return presentation(AF_INET, &raw).map { "\($0):\(port(address.sin_port))" }
+    }
+
+    /// nil for loopback, unspecified and link-local.
+    private static func server(_ address: sockaddr_in6) -> String? {
+        var raw = address.sin6_addr
+        let bytes = withUnsafeBytes(of: &raw) { Array($0) }
+        let isUnspecified = bytes.allSatisfy { $0 == 0 }
+        let isLoopback = bytes.dropLast().allSatisfy { $0 == 0 } && bytes.last == 1
+        let isLinkLocal = bytes[0] == 0xFE && bytes[1] & 0xC0 == 0x80
+        if isUnspecified || isLoopback || isLinkLocal { return nil }
+        return presentation(AF_INET6, &raw).map { "[\($0)]:\(port(address.sin6_port))" }
     }
 
     private static func ordered(_ servers: [String]) -> [String] {
@@ -664,15 +721,18 @@ enum OlcRtcDnsSelector {
 
     // MARK: Probing
 
-    /// Whether `server` answers one query for stream.wb.ru over `interface` within
-    /// a second. Any reply carrying our ID counts, even NXDOMAIN.
+    /// Whether `server` actually resolves the provider host over `interface`
+    /// within a second. The point is not that something replies: a resolver that
+    /// answers REFUSED or an empty NOERROR would be picked as the main one and
+    /// then fail every lookup olcRTC makes, so only a real answer counts.
     private static func answers(_ server: String, via interface: PhysicalInterface) -> Bool {
         guard let target = socketAddress(server) else { return false }
         var address = target.address
         let fd = socket(Int32(address.ss_family), SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { return false }
         defer { close(fd) }
-        interface.bind(fd)
+        // Probing through another interface would measure the wrong path.
+        guard interface.bind(fd) else { return false }
 
         let id = UInt16.random(in: .min ... .max)
         var query: [UInt8] = [UInt8(id >> 8), UInt8(id & 0xFF), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]
@@ -688,7 +748,11 @@ enum OlcRtcDnsSelector {
         guard sent == query.count, poll(&poller, 1, 1_000) == 1 else { return false }
         var reply = [UInt8](repeating: 0, count: 512)
         let received = recv(fd, &reply, 512, 0)
-        return received >= 12 && reply[0] == query[0] && reply[1] == query[1] && reply[2] & 0x80 != 0
+        // Header: id, QR (is a reply), RCODE (0 = NOERROR), ANCOUNT (records).
+        guard received >= 12, reply[0] == query[0], reply[1] == query[1], reply[2] & 0x80 != 0 else { return false }
+        let rcode = reply[3] & 0x0F
+        let answerCount = Int(reply[6]) << 8 | Int(reply[7])
+        return rcode == 0 && answerCount > 0
     }
 
     /// Parses "host:port" or "[v6]:port" with a numeric host.
@@ -790,12 +854,17 @@ struct PhysicalInterface {
 
     /// Scopes a socket to this interface (IP_BOUND_IF / IPV6_BOUND_IF, as
     /// Network.framework's requiredInterface does), so its traffic ignores the
-    /// routes of another VPN.
-    func bind(_ fd: Int32) {
+    /// routes of another VPN. False means the socket stayed on those routes.
+    @discardableResult
+    func bind(_ fd: Int32) -> Bool {
         var value = index
         let size = socklen_t(MemoryLayout<UInt32>.size)
-        _ = setsockopt(fd, IPPROTO_IP, Self.ipBoundIf, &value, size)
-        _ = setsockopt(fd, IPPROTO_IPV6, Self.ipv6BoundIf, &value, size)
+        // A socket belongs to one family, and the option of the other one is
+        // rejected, so one success is the whole story; none means the socket is
+        // still free to leave through the VPN, which must not pass silently.
+        let boundV4 = setsockopt(fd, IPPROTO_IP, Self.ipBoundIf, &value, size) == 0
+        let boundV6 = setsockopt(fd, IPPROTO_IPV6, Self.ipv6BoundIf, &value, size) == 0
+        return boundV4 || boundV6
     }
 }
 
@@ -845,7 +914,9 @@ private final class InterfaceSocketProtector: NSObject, MobileSocketProtectorPro
     func protect(_ fd: Int) -> Bool {
         // Resolved per socket: olcRTC reconnects inside a running session, and
         // after a network change its new sockets must follow the new interface.
-        PhysicalInterface.current()?.bind(Int32(truncatingIfNeeded: fd))
-        return true
+        // Reporting failure makes olcRTC drop the dial and retry; claiming
+        // success would hand it a socket that quietly runs through the VPN.
+        guard let interface = PhysicalInterface.current() else { return false }
+        return interface.bind(Int32(truncatingIfNeeded: fd))
     }
 }
