@@ -17,6 +17,8 @@ final class OlcDiag: @unchecked Sendable {
     private let lock = NSLock()
     private var sink: (@Sendable (String) -> Void)?
     private var last: [String: String] = [:]
+    private var counts: [String: Int] = [:]
+    private var stamps: [String: TimeInterval] = [:]
 
     private init() {}
 
@@ -31,6 +33,27 @@ final class OlcDiag: @unchecked Sendable {
         let output = shared.sink
         shared.lock.unlock()
         output?("diag: \(message)")
+    }
+
+    /// At most one line per `seconds`, for state that is worth repeating while
+    /// nothing happens but not on every call.
+    static func periodic(_ key: String, _ seconds: TimeInterval, _ message: @autoclosure () -> String) {
+        let now = ProcessInfo.processInfo.systemUptime
+        shared.lock.lock()
+        let due = now - (shared.stamps[key] ?? 0) >= seconds
+        if due { shared.stamps[key] = now }
+        shared.lock.unlock()
+        if due { log(message()) }
+    }
+
+    /// Every `step` calls, with the running total: the count says how busy the
+    /// connection was between two events without a line per socket.
+    static func every(_ step: Int, _ key: String, _ message: String) {
+        shared.lock.lock()
+        let total = (shared.counts[key] ?? 0) + 1
+        shared.counts[key] = total
+        shared.lock.unlock()
+        if total % step == 0 { log("\(message) (\(total) total)") }
     }
 
     /// For callbacks that fire per socket: log only when the answer changes,
@@ -86,6 +109,9 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
         DispatchQueue.global(qos: .utility).async { try? previous.stop(5_000) }
         do {
             next.setLogWriter(nativeLogWriter)
+            // olcRTC's own debug level, off by default: on a test build its
+            // handshake and ICE lines are most of what makes a drop explainable.
+            next.setDebug(true)
             next.setProtector(InterfaceSocketProtector())
             try next.setProvider(request.carrierName)
             try next.setTransport(request.transportName)
@@ -162,6 +188,13 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
         let running = runtime.state() == "running"
         let started = startedNetwork
         lock.unlock()
+        logLock.lock()
+        let lostSince = sessionLostAt
+        logLock.unlock()
+        let lost = lostSince.map { Int(ProcessInfo.processInfo.systemUptime - $0) }
+        OlcDiag.periodic("runtime", 60, "runtime=\(running ? "running" : "down") " +
+            "started-on=\(started ?? "none") now=\(PhysicalInterface.current()?.network ?? "offline") " +
+            "session=\(lost.map { "lost for \($0)s" } ?? "open")")
         guard running else { return false }
         // olcRTC reconnects inside a running session but keeps the DNS server it
         // was started with. After a network change report "not running", so the
@@ -1091,9 +1124,14 @@ private final class InterfaceSocketProtector: NSObject, MobileSocketProtectorPro
             return false
         }
         let bound = interface.bind(Int32(truncatingIfNeeded: fd))
-        OlcDiag.changed("protect", bound
-            ? "protect: olcRTC sockets bound to \(interface.network)"
-            : "protect: binding to \(interface.name) failed (errno \(errno)); sockets are refused")
+        // A failure is worth a line every time; a success only when the answer
+        // changes, plus a running count, since olcRTC opens sockets constantly.
+        if bound {
+            OlcDiag.changed("protect", "protect: olcRTC sockets bound to \(interface.network)")
+            OlcDiag.every(50, "protect", "sockets bound to \(interface.network)")
+        } else {
+            OlcDiag.log("protect: binding to \(interface.name) failed (errno \(errno)); socket refused")
+        }
         return bound
     }
 }

@@ -32,7 +32,8 @@ import platform.Foundation.NSUserDefaults
 
 class IosVpnManager(
     private val locationsRepository: LocationsRepository,
-    private val olcRtcBridge: IosOlcRtcBridge
+    private val olcRtcBridge: IosOlcRtcBridge,
+    private val logStore: IosLogStore = IosLogStore()
 ) : VpnManager {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -65,6 +66,10 @@ class IosVpnManager(
     private var lastReadyMark: TimeSource.Monotonic.ValueTimeMark? = null
 
     init {
+        // The sheet starts with what the previous runs wrote, so a multi-day test
+        // reads as one log even though iOS restarted the app in between.
+        _logs.value = logStore.tail(MAX_LOG_LINES)
+        addLog("--- app launched (${org.olcbox.app.CurrentAppInfo.diagnosticVersion}) ---")
         olcRtcBridge.setLogWriter(object : IosLogWriter {
             override fun writeLog(message: String) {
                 message
@@ -281,12 +286,19 @@ class IosVpnManager(
     private fun startWatchdog() {
         watchdogJob?.cancel()
         watchdogJob = scope.launch {
+            var ticks = 0
             while (isActive && desiredConnected) {
                 delay(WATCHDOG_INTERVAL_MS)
                 if (!desiredConnected) break
+                val running = olcRtcBridge.isRunning()
                 val stalled = _status.value is VpnStatus.Connected &&
                     reconnectJob?.isActive != true &&
-                    !olcRtcBridge.isRunning()
+                    !running
+                // A heartbeat every minute: without it the log cannot tell a quiet
+                // night from an app the system had suspended.
+                if (ticks++ % HEARTBEAT_EVERY_TICKS == 0) {
+                    addLog("watchdog: state=${name(_status.value)} runtime=${if (running) "running" else "down"}")
+                }
                 if (stalled) {
                     addLog("Watchdog: iOS SOCKS transport is down")
                     scheduleReconnect("transport stopped")
@@ -336,20 +348,31 @@ class IosVpnManager(
         return (RECONNECT_BASE_DELAY_MS * multiplier).coerceAtMost(RECONNECT_MAX_DELAY_MS)
     }
 
+    // Every state change is written down: over days the sequence of states is what
+    // tells a real outage from a reconnect that recovered on its own.
     private fun setStatus(status: VpnStatus) {
+        val previous = _status.value
+        if (previous != status) addLog("state: ${name(previous)} -> ${name(status)}")
         _status.value = status
         _isConnected.value = status is VpnStatus.Connected
     }
 
-    // A log line is only useful for a network problem if it says when it happened:
-    // the gap between "reconnect reason=" and the next "session opened" is the
-    // outage. The formatter is built per line so nothing is shared between the
-    // threads the bridge logs from; at this rate that costs nothing.
+    private fun name(status: VpnStatus): String = when (status) {
+        is VpnStatus.Error -> "error(${status.message})"
+        else -> status::class.simpleName ?: "unknown"
+    }
+
+    // A log line is only useful for a network problem if it says when it happened,
+    // and a multi-day test needs the date as well. The formatter is built per line
+    // so nothing is shared between the threads the bridge logs from; at this rate
+    // that costs nothing.
     private fun addLog(message: String) {
         val stamp = NSDateFormatter()
-            .apply { dateFormat = "HH:mm:ss.SSS" }
+            .apply { dateFormat = "MM-dd HH:mm:ss.SSS" }
             .stringFromDate(NSDate())
-        _logs.value = (_logs.value + "$stamp $message").takeLast(MAX_LOG_LINES)
+        val line = "$stamp $message"
+        logStore.append(line)
+        _logs.value = (_logs.value + line).takeLast(MAX_LOG_LINES)
     }
 
     private fun LocationConfig.startRequest(
@@ -424,6 +447,7 @@ class IosVpnManager(
         const val CHECK_TIMEOUT_MS = 8_000L
         const val HTTP_PING_URL = "https://www.google.com/generate_204"
         const val WATCHDOG_INTERVAL_MS = 10_000L
+        const val HEARTBEAT_EVERY_TICKS = 6
         const val RECONNECT_BASE_DELAY_MS = 2_000L
         const val RECONNECT_MAX_DELAY_MS = 30_000L
         const val MAX_RECONNECT_BACKOFF_POWER = 3

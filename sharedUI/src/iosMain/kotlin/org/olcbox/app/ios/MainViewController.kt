@@ -39,6 +39,7 @@ import org.olcbox.app.update.identity
 import org.olcbox.app.update.isDownloaded
 import org.olcbox.app.update.isUpdateCheckDue
 import org.olcbox.app.update.shouldShowOffer
+import org.olcbox.app.vpn.IosLogStore
 import org.olcbox.app.vpn.IosVpnManager
 import platform.Foundation.NSUserDefaults
 import platform.UIKit.UIViewController
@@ -82,7 +83,8 @@ private class IosAppDependencies(
 ) {
     private val locationsDataSource = IosLocationsDataSourceImpl()
     val locationsRepository = LocationsRepositoryImpl(locationsDataSource)
-    val vpnManager = IosVpnManager(locationsRepository, olcRtcBridge)
+    private val logStore = IosLogStore()
+    val vpnManager = IosVpnManager(locationsRepository, olcRtcBridge, logStore)
     val updateService = AppUpdateService(
         deviceIdentityProvider = PersistentDeviceIdentityProvider(locationsDataSource)
     )
@@ -91,7 +93,7 @@ private class IosAppDependencies(
         vpnManager = vpnManager,
         locationsRepository = locationsRepository,
         configImporter = IosConfigImporter(platformBridge),
-        logExporter = IosLogExporter(platformBridge)
+        logExporter = IosLogExporter(platformBridge) { logStore.history() }
     )
     val locationViewModel = LocationViewModel(locationsRepository)
 
