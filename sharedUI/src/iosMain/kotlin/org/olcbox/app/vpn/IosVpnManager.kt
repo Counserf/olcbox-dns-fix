@@ -26,6 +26,8 @@ import org.olcbox.app.ios.IosOlcRtcBridge
 import org.olcbox.app.ios.IosOlcRtcCheckRequest
 import org.olcbox.app.ios.IosOlcRtcStartRequest
 import org.olcbox.app.ui.components.ApplicationSocksProxySettings
+import platform.Foundation.NSDate
+import platform.Foundation.NSDateFormatter
 import platform.Foundation.NSUserDefaults
 
 class IosVpnManager(
@@ -339,8 +341,15 @@ class IosVpnManager(
         _isConnected.value = status is VpnStatus.Connected
     }
 
+    // A log line is only useful for a network problem if it says when it happened:
+    // the gap between "reconnect reason=" and the next "session opened" is the
+    // outage. The formatter is built per line so nothing is shared between the
+    // threads the bridge logs from; at this rate that costs nothing.
     private fun addLog(message: String) {
-        _logs.value = (_logs.value + message).takeLast(MAX_LOG_LINES)
+        val stamp = NSDateFormatter()
+            .apply { dateFormat = "HH:mm:ss.SSS" }
+            .stringFromDate(NSDate())
+        _logs.value = (_logs.value + "$stamp $message").takeLast(MAX_LOG_LINES)
     }
 
     private fun LocationConfig.startRequest(
@@ -411,7 +420,7 @@ class IosVpnManager(
         const val USERNAME_LENGTH = 12
         const val PASSWORD_LENGTH = 24
         const val MAX_CREDENTIAL_LENGTH = 64
-        const val MAX_LOG_LINES = 500
+        const val MAX_LOG_LINES = 3000
         const val CHECK_TIMEOUT_MS = 8_000L
         const val HTTP_PING_URL = "https://www.google.com/generate_204"
         const val WATCHDOG_INTERVAL_MS = 10_000L

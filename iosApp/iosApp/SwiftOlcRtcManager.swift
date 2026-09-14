@@ -7,6 +7,40 @@ import OlcRtcMobile
 import SharedUI
 import UIKit
 
+/// Test-build diagnostics. Everything that decides which interface and which DNS
+/// server olcRTC gets is written into the app's own log, so the phone alone is
+/// enough to see why a connection failed — no Mac and no console capture.
+/// Static call sites (the socket protector, the DNS probe) reach the log through
+/// here, since they have no reference to the manager.
+enum OlcDiag {
+    private static let lock = NSLock()
+    private static var sink: ((String) -> Void)?
+    private static var last: [String: String] = [:]
+
+    static func install(_ output: @escaping (String) -> Void) {
+        lock.lock()
+        sink = output
+        lock.unlock()
+    }
+
+    static func log(_ message: String) {
+        lock.lock()
+        let output = sink
+        lock.unlock()
+        output?("diag: \(message)")
+    }
+
+    /// For callbacks that fire per socket: log only when the answer changes,
+    /// otherwise one connection would bury the log in identical lines.
+    static func changed(_ key: String, _ message: String) {
+        lock.lock()
+        let isNew = last[key] != message
+        last[key] = message
+        lock.unlock()
+        if isNew { log(message) }
+    }
+}
+
 final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
     private var logWriter: IosLogWriter?
     private var runtime = MobileNew()!
@@ -24,13 +58,17 @@ final class SwiftOlcRtcManager: NSObject, @unchecked Sendable, IosOlcRtcBridge {
 
     func setLogWriter(writer: IosLogWriter?) {
         logLock.lock()
-        defer { logLock.unlock() }
         logWriter = writer
+        logLock.unlock()
+        OlcDiag.install { [weak self] in self?.log($0) }
     }
 
     func start(request: IosOlcRtcStartRequest) -> IosBridgeResult {
         let interface = PhysicalInterface.current()
         let probeHost = OlcRtcDnsSelector.probeHost(provider: request.carrierName, room: request.roomId)
+        OlcDiag.log("start provider=\(request.carrierName) transport=\(request.transportName) " +
+            "interface=\(interface?.network ?? "none") probe-host=\(probeHost) " +
+            "configured-dns=\(request.dnsServer.isEmpty ? "auto" : request.dnsServer)")
         guard let dnsServer = OlcRtcDnsSelector.select(configured: request.dnsServer, interface: interface, host: probeHost, log: makeLogger()) else {
             // Usually the network is still coming up; the reconnect loop retries soon.
             return IosBridgeResult(success: false, message: "No DNS server is reachable")
@@ -577,13 +615,20 @@ enum OlcRtcDnsSelector {
         if !scoped.isEmpty { log("System DNS servers of \(interface.name): \(scoped.joined(separator: ", "))") }
         let defaults = UserDefaults.standard
         let recent = defaults.stringArray(forKey: recentKey) ?? []
+        let vpnUp = isVpnActive()
+        let system = vpnUp ? [] : systemServers()
         var seen = Set<String>()
-        let candidates = (scoped + (isVpnActive() ? [] : systemServers()) + recent + fallbackServers)
+        let candidates = (scoped + system + recent + fallbackServers)
             .filter { seen.insert($0).inserted }
+        OlcDiag.log("dns candidates via \(interface.name): scoped=[\(scoped.joined(separator: " "))] " +
+            "system=[\(system.joined(separator: " "))] recent=[\(recent.joined(separator: " "))] " +
+            "other-vpn=\(vpnUp)")
 
         for server in candidates {
-            guard answers(server, via: interface, host: host) else {
-                log("DNS server \(server) did not resolve \(host) via \(interface.name)")
+            let started = ProcessInfo.processInfo.systemUptime
+            if let failure = probeFailure(server, via: interface, host: host) {
+                let millis = Int((ProcessInfo.processInfo.systemUptime - started) * 1000)
+                log("DNS server \(server) did not resolve \(host) via \(interface.name): \(failure) (\(millis)ms)")
                 continue
             }
             if !fallbackServers.contains(server) {
@@ -667,18 +712,36 @@ enum OlcRtcDnsSelector {
             log("System DNS configuration has no per-interface resolvers")
             return []
         }
+        // The one assumption this code cannot check by itself is that dnsinfo is a
+        // single allocation, since malloc_size of that block is what bounds every
+        // read. Printing the block size next to each resolver it did manage to
+        // read is what shows, from the phone, whether the bound is right.
+        OlcDiag.log("dnsinfo: block \(blob.size) bytes, \(scopedCount) per-interface resolvers, " +
+            "looking for interface \(index)")
+        var result: [String] = []
         for slot in 0..<scopedCount {
             // dns_resolver_t: n_nameserver at 8, nameserver at 12, if_index at 64,
             // if_name at 88, so a resolver entry reaches at least that far.
-            guard let resolver = blob.pointer(resolvers, slot * 8, needs: 96),
-                  blob.read(resolver, 64, as: UInt32.self) == index,
-                  let total = blob.count(resolver, 8),
-                  let nameservers = blob.pointer(resolver, 12, needs: total * 8) else { continue }
-            let found = (0..<total).compactMap { slot -> String? in
-                blob.pointer(nameservers, slot * 8, needs: 2).flatMap { server(blob, $0) }
+            guard let resolver = blob.pointer(resolvers, slot * 8, needs: 96) else {
+                OlcDiag.log("dnsinfo: resolver \(slot) lies outside the block")
+                continue
             }
-            if !found.isEmpty { return ordered(found) }
+            let ifIndex = blob.read(resolver, 64, as: UInt32.self)
+            let ifName = blob.pointer(resolver, 88, needs: 1).flatMap { blob.text($0) }
+            let total = blob.count(resolver, 8)
+            let nameservers = total.flatMap { blob.pointer(resolver, 12, needs: $0 * 8) }
+            var found: [String] = []
+            if let total, let nameservers {
+                found = (0..<total).compactMap { entry in
+                    blob.pointer(nameservers, entry * 8, needs: 2).flatMap { server(blob, $0) }
+                }
+            }
+            OlcDiag.log("dnsinfo: resolver \(slot) if_index=\(ifIndex.map(String.init) ?? "?") " +
+                "if_name=\(ifName ?? "?") servers=\(total.map(String.init) ?? "?")" +
+                "[\(found.joined(separator: " "))]")
+            if ifIndex == index, !found.isEmpty, result.isEmpty { result = ordered(found) }
         }
+        if !result.isEmpty { return result }
         log("System DNS configuration has \(scopedCount) per-interface resolvers, none for interface \(index)")
         return []
     }
@@ -720,6 +783,18 @@ enum OlcRtcDnsSelector {
                   let target = UnsafeRawPointer(bitPattern: UInt(raw)),
                   fits(target, bytes) else { return nil }
             return target
+        }
+
+        /// A NUL-terminated name inside the block, for diagnostics only: at most
+        /// 64 bytes and never past the end.
+        func text(_ from: UnsafeRawPointer) -> String? {
+            var bytes: [UInt8] = []
+            for offset in 0..<64 {
+                guard let byte = read(from, offset, as: UInt8.self) else { return nil }
+                if byte == 0 { break }
+                bytes.append(byte)
+            }
+            return bytes.isEmpty ? nil : String(decoding: bytes, as: UTF8.self)
         }
 
         func count(_ from: UnsafeRawPointer, _ offset: Int) -> Int? {
@@ -793,14 +868,18 @@ enum OlcRtcDnsSelector {
     /// within a second. The point is not that something replies: a resolver that
     /// answers REFUSED or an empty NOERROR would be picked as the main one and
     /// then fail every lookup olcRTC makes, so only a real answer counts.
-    private static func answers(_ server: String, via interface: PhysicalInterface, host: String) -> Bool {
-        guard let target = socketAddress(server) else { return false }
+    ///
+    /// Returns nil when the resolver answered, otherwise the reason it was
+    /// rejected — the log line that names it is what makes a failed connect
+    /// readable on the phone itself.
+    private static func probeFailure(_ server: String, via interface: PhysicalInterface, host: String) -> String? {
+        guard let target = socketAddress(server) else { return "address is not parseable" }
         var address = target.address
         let fd = socket(Int32(address.ss_family), SOCK_DGRAM, IPPROTO_UDP)
-        guard fd >= 0 else { return false }
+        guard fd >= 0 else { return "no socket (errno \(errno))" }
         defer { close(fd) }
         // Probing through another interface would measure the wrong path.
-        guard interface.bind(fd) else { return false }
+        guard interface.bind(fd) else { return "socket could not be bound to \(interface.name)" }
 
         // Connected, so the kernel drops datagrams from anyone but this server:
         // on an unconnected socket a host on the same network could answer first
@@ -808,7 +887,7 @@ enum OlcRtcDnsSelector {
         let connected = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, target.length) }
         }
-        guard connected == 0 else { return false }
+        guard connected == 0 else { return "connect failed (errno \(errno))" }
 
         let id = UInt16.random(in: .min ... .max)
         var query: [UInt8] = [UInt8(id >> 8), UInt8(id & 0xFF), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]
@@ -818,18 +897,23 @@ enum OlcRtcDnsSelector {
         }
         query.append(contentsOf: [0, 0, 1, 0, 1]) // root, type A, class IN
         let sent = send(fd, query, query.count, 0)
+        guard sent == query.count else { return "query not sent (errno \(errno))" }
         var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-        guard sent == query.count, poll(&poller, 1, 1_000) == 1 else { return false }
+        guard poll(&poller, 1, 1_000) == 1 else { return "no reply within 1s" }
         var reply = [UInt8](repeating: 0, count: 512)
         let received = recv(fd, &reply, reply.count, 0)
         // Header: id, QR (is a reply), TC (truncated), RCODE, ANCOUNT.
-        guard received >= 12, reply[0] == query[0], reply[1] == query[1], reply[2] & 0x80 != 0 else { return false }
-        guard reply[3] & 0x0F == 0 else { return false } // anything but NOERROR
+        guard received >= 12 else { return "reply is \(received) bytes" }
+        guard reply[0] == query[0], reply[1] == query[1] else { return "reply belongs to another query" }
+        guard reply[2] & 0x80 != 0 else { return "reply is not an answer" }
+        let code = reply[3] & 0x0F
+        guard code == 0 else { return "answered RCODE \(code)" } // anything but NOERROR
         // A truncated reply proves the resolver answered even with no records in
         // this datagram; otherwise an actual record has to be there.
         let truncated = reply[2] & 0x02 != 0
         let answerCount = Int(reply[6]) << 8 | Int(reply[7])
-        return truncated || answerCount > 0
+        guard truncated || answerCount > 0 else { return "answered NOERROR with no records" }
+        return nil
     }
 
     /// Parses "host:port" or "[v6]:port" with a numeric host.
@@ -906,10 +990,16 @@ struct PhysicalInterface {
         }
         // With two SIMs both cellular interfaces keep addresses; only the path
         // monitor knows which line carries data.
-        let name = PhysicalPath.shared.interfaceName()
-            ?? (ipv4["en0"] != nil ? "en0" : order.first { $0.hasPrefix("pdp_ip") })
-        guard let name, let address = ipv4[name] ?? ipv6[name] else { return nil }
+        let preferred = PhysicalPath.shared.interfaceName()
+        let name = preferred ?? (ipv4["en0"] != nil ? "en0" : order.first { $0.hasPrefix("pdp_ip") })
+        guard let name, let address = ipv4[name] ?? ipv6[name] else {
+            OlcDiag.changed("interface", "interface: none of \(order.joined(separator: " ")) is usable " +
+                "(path monitor says \(preferred ?? "offline"))")
+            return nil
+        }
         let index = if_nametoindex(name)
+        OlcDiag.changed("interface", "interface: \(name)/\(index) \(address) " +
+            "(path monitor says \(preferred ?? "nothing"); up: \(order.joined(separator: " ")))")
         return index == 0 ? nil : PhysicalInterface(name: name, index: index, address: address)
     }
 
@@ -993,7 +1083,14 @@ private final class InterfaceSocketProtector: NSObject, MobileSocketProtectorPro
         // after a network change its new sockets must follow the new interface.
         // Reporting failure makes olcRTC drop the dial and retry; claiming
         // success would hand it a socket that quietly runs through the VPN.
-        guard let interface = PhysicalInterface.current() else { return false }
-        return interface.bind(Int32(truncatingIfNeeded: fd))
+        guard let interface = PhysicalInterface.current() else {
+            OlcDiag.changed("protect", "protect: no physical interface; olcRTC sockets are refused")
+            return false
+        }
+        let bound = interface.bind(Int32(truncatingIfNeeded: fd))
+        OlcDiag.changed("protect", bound
+            ? "protect: olcRTC sockets bound to \(interface.network)"
+            : "protect: binding to \(interface.name) failed (errno \(errno)); sockets are refused")
+        return bound
     }
 }
