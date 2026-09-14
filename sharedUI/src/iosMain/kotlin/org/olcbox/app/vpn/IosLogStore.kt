@@ -15,6 +15,7 @@ import platform.Foundation.closeFile
 import platform.Foundation.create
 import platform.Foundation.dataUsingEncoding
 import platform.Foundation.dataWithContentsOfFile
+import platform.Foundation.fileHandleForWritingAtPath
 import platform.Foundation.seekToEndOfFile
 import platform.Foundation.writeData
 
@@ -112,6 +113,6 @@ class IosLogStore(appDirectoryName: String = "Olcbox") {
     }
 
     private companion object {
-        const val MAX_FILE_BYTES = 12UL * 1024UL * 1024UL
+        val MAX_FILE_BYTES: ULong = 12UL * 1024UL * 1024UL
     }
 }
