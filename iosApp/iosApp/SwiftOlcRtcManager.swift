@@ -12,31 +12,34 @@ import UIKit
 /// enough to see why a connection failed — no Mac and no console capture.
 /// Static call sites (the socket protector, the DNS probe) reach the log through
 /// here, since they have no reference to the manager.
-enum OlcDiag {
-    private static let lock = NSLock()
-    private static var sink: ((String) -> Void)?
-    private static var last: [String: String] = [:]
+final class OlcDiag: @unchecked Sendable {
+    private static let shared = OlcDiag()
+    private let lock = NSLock()
+    private var sink: (@Sendable (String) -> Void)?
+    private var last: [String: String] = [:]
 
-    static func install(_ output: @escaping (String) -> Void) {
-        lock.lock()
-        sink = output
-        lock.unlock()
+    private init() {}
+
+    static func install(_ output: @escaping @Sendable (String) -> Void) {
+        shared.lock.lock()
+        shared.sink = output
+        shared.lock.unlock()
     }
 
     static func log(_ message: String) {
-        lock.lock()
-        let output = sink
-        lock.unlock()
+        shared.lock.lock()
+        let output = shared.sink
+        shared.lock.unlock()
         output?("diag: \(message)")
     }
 
     /// For callbacks that fire per socket: log only when the answer changes,
     /// otherwise one connection would bury the log in identical lines.
     static func changed(_ key: String, _ message: String) {
-        lock.lock()
-        let isNew = last[key] != message
-        last[key] = message
-        lock.unlock()
+        shared.lock.lock()
+        let isNew = shared.last[key] != message
+        shared.last[key] = message
+        shared.lock.unlock()
         if isNew { log(message) }
     }
 }
