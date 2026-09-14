@@ -39,6 +39,8 @@ class IosVpnManager(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mutex = Mutex()
 
+    private val rtcNoise = RtcNoiseFilter()
+
     private val _logs = MutableStateFlow<List<String>>(emptyList())
     override val logs: StateFlow<List<String>> = _logs.asStateFlow()
 
@@ -75,8 +77,8 @@ class IosVpnManager(
                 message
                     .trim()
                     .takeIf { it.isNotBlank() }
-                    ?.let {
-                        addLog("rtc: $it")
+                    ?.let { line ->
+                        rtcNoise.filter(line).forEach { addLog("rtc: $it") }
                     }
             }
         })
@@ -296,6 +298,8 @@ class IosVpnManager(
                     !running
                 // A heartbeat every minute: without it the log cannot tell a quiet
                 // night from an app the system had suspended.
+                // A burst that simply stopped has no next line to carry its count.
+                rtcNoise.flush().forEach { addLog("rtc: $it") }
                 if (ticks++ % HEARTBEAT_EVERY_TICKS == 0) {
                     addLog("watchdog: state=${name(_status.value)} runtime=${if (running) "running" else "down"}")
                 }
