@@ -16,6 +16,7 @@ import platform.Foundation.create
 import platform.Foundation.dataUsingEncoding
 import platform.Foundation.dataWithContentsOfFile
 import platform.Foundation.fileHandleForWritingAtPath
+import platform.Foundation.offsetInFile
 import platform.Foundation.seekToEndOfFile
 import platform.Foundation.writeData
 
