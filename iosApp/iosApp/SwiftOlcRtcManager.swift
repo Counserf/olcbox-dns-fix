@@ -1111,7 +1111,6 @@ struct PhysicalInterface {
         // interface's output path is exercised rather than short-circuited.
         let query: [UInt8] = [0x4F, 0x42, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1]
         return send(fd, query, query.count, 0) == query.count
->>>>>>> dc78e4a (fix(ios): pick the SIM that carries data while another VPN is up)
     }
 
     private static func text(_ address: UnsafeMutablePointer<sockaddr>) -> String {
