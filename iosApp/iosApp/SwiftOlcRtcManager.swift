@@ -988,8 +988,9 @@ enum OlcRtcDnsSelector {
 }
 
 /// The interface the phone would use without a VPN: what the system path monitor
-/// prefers (Wi-Fi, or the cellular line chosen for data), falling back to Wi-Fi
-/// (en0) with an IPv4 address, then the first cellular interface.
+/// prefers (Wi-Fi, or the cellular line chosen for data). While another VPN hides
+/// that answer, the first of Wi-Fi, the last reported data line and the other
+/// cellular lines that a packet actually leaves through.
 struct PhysicalInterface {
     let name: String
     let index: UInt32
@@ -1024,19 +1025,93 @@ struct PhysicalInterface {
             }
             if !order.contains(name) { order.append(name) }
         }
-        // With two SIMs both cellular interfaces keep addresses; only the path
-        // monitor knows which line carries data.
-        let preferred = PhysicalPath.shared.interfaceName()
-        let name = preferred ?? (ipv4["en0"] != nil ? "en0" : order.first { $0.hasPrefix("pdp_ip") })
-        guard let name, let address = ipv4[name] ?? ipv6[name] else {
-            OlcDiag.changed("interface", "interface: none of \(order.joined(separator: " ")) is usable " +
-                "(path monitor says \(preferred ?? "offline"))")
-            return nil
+        func make(_ name: String) -> PhysicalInterface? {
+            guard let address = ipv4[name] ?? ipv6[name] else { return nil }
+            let index = if_nametoindex(name)
+            return index == 0 ? nil : PhysicalInterface(name: name, index: index, address: address)
         }
-        let index = if_nametoindex(name)
-        OlcDiag.changed("interface", "interface: \(name)/\(index) \(address) " +
-            "(path monitor says \(preferred ?? "nothing"); up: \(order.joined(separator: " ")))")
-        return index == 0 ? nil : PhysicalInterface(name: name, index: index, address: address)
+        let path = PhysicalPath.shared.snapshot()
+        let up = order.joined(separator: " ")
+        if let name = path.current, let interface = make(name) {
+            OlcDiag.changed("interface", "interface: \(interface.name)/\(interface.index) \(interface.address) " +
+                "(path monitor says \(name); up: \(up))")
+            return interface
+        }
+
+        // The monitor goes quiet whenever another VPN such as Happ owns the default
+        // route. With two SIMs both cellular interfaces keep an address, but only
+        // one carries data: the other rejects every packet (EPIPE), so picking the
+        // first pdp_ip in the list could land on a line where nothing works. Try
+        // Wi-Fi, then the data line the monitor reported last, then the other
+        // cellular lines, and keep the first one a packet actually leaves through.
+        var candidates: [String] = []
+        if ipv4["en0"] != nil { candidates.append("en0") }
+        if let last = path.lastCellular { candidates.append(last) }
+        candidates += order.filter { $0.hasPrefix("pdp_ip") }
+        var seen = Set<String>()
+        var rejected: [String] = []
+        for name in candidates where seen.insert(name).inserted {
+            guard let interface = make(name) else { continue }
+            if interface.carriesTraffic(ipv4: ipv4[name] != nil) {
+                OlcDiag.changed("interface", "interface: \(interface.name)/\(interface.index) \(interface.address) " +
+                    "(path monitor says nothing; last data line \(path.lastCellular ?? "unknown"); " +
+                    "no traffic through [\(rejected.joined(separator: " "))]; up: \(up))")
+                return interface
+            }
+            rejected.append(name)
+        }
+        OlcDiag.changed("interface", "interface: none carries traffic (tried \(rejected.joined(separator: " ")); " +
+            "path monitor says nothing; up: \(up))")
+        return nil
+    }
+
+    /// Whether a datagram leaves through this interface. The dead SIM of a
+    /// dual-SIM phone fails the send at once, so this needs no reply and costs
+    /// no waiting. Cached briefly: the socket protector asks per socket.
+    private func carriesTraffic(ipv4: Bool) -> Bool {
+        if let cached = SendCheckCache.shared.result(for: network) { return cached }
+        let ok = sendsDatagram(ipv4: ipv4)
+        SendCheckCache.shared.store(ok, for: network)
+        return ok
+    }
+
+    private func sendsDatagram(ipv4: Bool) -> Bool {
+        var storage = sockaddr_storage()
+        let length: socklen_t
+        if ipv4 {
+            var target = sockaddr_in()
+            target.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            target.sin_family = sa_family_t(AF_INET)
+            target.sin_port = in_port_t(53).bigEndian
+            target.sin_addr.s_addr = inet_addr("1.1.1.1")
+            withUnsafeMutableBytes(of: &storage) { dst in
+                withUnsafeBytes(of: &target) { dst.copyMemory(from: $0) }
+            }
+            length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        } else {
+            var target = sockaddr_in6()
+            target.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+            target.sin6_family = sa_family_t(AF_INET6)
+            target.sin6_port = in_port_t(53).bigEndian
+            _ = inet_pton(AF_INET6, "2606:4700:4700::1111", &target.sin6_addr)
+            withUnsafeMutableBytes(of: &storage) { dst in
+                withUnsafeBytes(of: &target) { dst.copyMemory(from: $0) }
+            }
+            length = socklen_t(MemoryLayout<sockaddr_in6>.size)
+        }
+        let fd = socket(ipv4 ? AF_INET : AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        guard bind(fd) else { return false }
+        let connected = withUnsafePointer(to: &storage) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, length) }
+        }
+        guard connected == 0 else { return false }
+        // A root NS query: harmless to the resolver, and a real packet, so the
+        // interface's output path is exercised rather than short-circuited.
+        let query: [UInt8] = [0x4F, 0x42, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1]
+        return send(fd, query, query.count, 0) == query.count
+>>>>>>> dc78e4a (fix(ios): pick the SIM that carries data while another VPN is up)
     }
 
     private static func text(_ address: UnsafeMutablePointer<sockaddr>) -> String {
@@ -1071,15 +1146,40 @@ struct PhysicalInterface {
     }
 }
 
+/// Recent answers of PhysicalInterface.carriesTraffic, keyed by interface and
+/// address, so a new address is checked again at once.
+private final class SendCheckCache: @unchecked Sendable {
+    static let shared = SendCheckCache()
+    private let lock = NSLock()
+    private var entries: [String: (ok: Bool, at: TimeInterval)] = [:]
+    private let ttl: TimeInterval = 5
+
+    func result(for network: String) -> Bool? {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = entries[network], now - entry.at < ttl else { return nil }
+        return entry.ok
+    }
+
+    func store(_ ok: Bool, for network: String) {
+        lock.lock()
+        entries[network] = (ok, ProcessInfo.processInfo.systemUptime)
+        lock.unlock()
+    }
+}
+
 /// Tracks the interface iOS would use if no VPN were up. VPN tunnels are "other"
-/// interfaces and are left out, so the answer stays right while Happ is up and
-/// follows a switch of the cellular data line.
+/// interfaces and are left out; but while one owns the default route the path is
+/// unsatisfied and the monitor names nothing, which is why the last cellular data
+/// line it did name is kept.
 private final class PhysicalPath: @unchecked Sendable {
     static let shared = PhysicalPath()
     private let monitor = NWPathMonitor(prohibitedInterfaceTypes: [.other])
     private let firstUpdate = DispatchGroup()
     private let lock = NSLock()
     private var name: String?
+    private var lastCellular: String?
     private var updated = false
 
     private init() {
@@ -1095,17 +1195,23 @@ private final class PhysicalPath: @unchecked Sendable {
         let first = !updated
         updated = true
         name = path.status == .satisfied ? preferred?.name : nil
+        // Remembered past the moment a VPN comes up and the monitor goes quiet:
+        // it is the best guess at which SIM carries data.
+        if path.status == .satisfied, let cellular = path.availableInterfaces.first(where: { $0.type == .cellular }) {
+            lastCellular = cellular.name
+        }
         lock.unlock()
         if first { firstUpdate.leave() }
     }
 
-    /// The preferred physical interface; nil while offline or if the monitor
-    /// has not reported within a second.
-    func interfaceName() -> String? {
+    /// The preferred physical interface (nil while offline, while another VPN
+    /// owns the default route, or if the monitor has not reported within a
+    /// second) and the cellular data line it reported last.
+    func snapshot() -> (current: String?, lastCellular: String?) {
         _ = firstUpdate.wait(timeout: .now() + 1)
         lock.lock()
         defer { lock.unlock() }
-        return name
+        return (name, lastCellular)
     }
 }
 
